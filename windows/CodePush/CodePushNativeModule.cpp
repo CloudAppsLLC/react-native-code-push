@@ -738,7 +738,7 @@ namespace Microsoft::CodePush::ReactNative
     /*
      * This method clears CodePush's downloaded updates.
      * It is needed to switch to a different deployment if the current deployment is more recent.
-     * Note: we don’t recommend to use this method in scenarios other than that (CodePush will call this method
+     * Note: we donï¿½t recommend to use this method in scenarios other than that (CodePush will call this method
      * automatically when needed in other cases) as it could lead to unpredictable behavior.
      */
     fire_and_forget CodePushNativeModule::ClearUpdates() noexcept 
@@ -754,7 +754,7 @@ namespace Microsoft::CodePush::ReactNative
      */
     fire_and_forget CodePushNativeModule::DownloadAndReplaceCurrentBundle(std::wstring remoteBundleUrl) noexcept 
     {
-        auto errorMessage{ L"Error: DownloadAndReplaceCurrentBundle is not currently implmented" };
+        auto errorMessage{ L"Error: DownloadAndReplaceCurrentBundle is not currently implemented" };
         hresult_error error{ E_NOTIMPL, errorMessage };
         CodePushUtils::Log(error);
         throw error;
