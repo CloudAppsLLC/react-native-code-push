@@ -24,6 +24,12 @@ namespace Microsoft::CodePush::ReactNative
 
 	/*static*/ void CodePushUtils::LogBundleUrl(const IStorageFile& bundle)
 	{
+		if (!bundle)
+		{
+			CodePushUtils::Log(L"⚠️ Tried to log JS bundle path, but bundle is null.");
+			return;
+		}
+
 		CodePushUtils::Log(L"Loading JS bundle from \"" + bundle.Path() + L"\"");
 	}
 }
