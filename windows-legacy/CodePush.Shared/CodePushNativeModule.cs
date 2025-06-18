@@ -112,7 +112,7 @@ namespace CodePush.ReactNative
                 { "appVersion", _codePush.AppVersion },
                 { "clientUniqueId", CodePushUtils.GetDeviceId() },
                 { "deploymentKey", _codePush.DeploymentKey },
-                { "serverUrl", CodePushConstants.CodePushServerUrl }
+                { "serverUrl", _codePush.serverUrl }
             };
 
             // TODO generate binary hash
