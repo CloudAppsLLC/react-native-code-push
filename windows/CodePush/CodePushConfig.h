@@ -48,7 +48,6 @@ namespace winrt::Microsoft::CodePush::ReactNative::implementation
 
         Windows::Foundation::Collections::IMap<hstring, hstring> m_configuration;
 
-
         hstring QueryConfig(std::wstring_view key);
     };
 }
