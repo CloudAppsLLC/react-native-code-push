@@ -7,7 +7,6 @@ import android.content.res.Resources;
 
 import com.facebook.react.ReactInstanceManager;
 import com.facebook.react.ReactPackage;
-import com.facebook.react.bridge.JavaScriptModule;
 import com.facebook.react.bridge.NativeModule;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.devsupport.interfaces.DevSupportManager;
@@ -427,11 +426,6 @@ public class CodePush implements ReactPackage {
         nativeModules.add(codePushModule);
         nativeModules.add(dialogModule);
         return nativeModules;
-    }
-
-    // Deprecated in RN v0.47.
-    public List<Class<? extends JavaScriptModule>> createJSModules() {
-        return new ArrayList<>();
     }
 
     @Override
