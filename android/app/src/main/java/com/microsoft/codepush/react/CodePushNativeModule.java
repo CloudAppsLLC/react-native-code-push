@@ -20,9 +20,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.modules.core.ChoreographerCompat;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
-import com.facebook.react.modules.core.ReactChoreographer;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -93,7 +91,7 @@ public class CodePushNativeModule extends ReactContextBaseJavaModule {
     }
 
     private void loadBundleLegacy() {
-        final Activity currentActivity = getCurrentActivity();
+        final Activity currentActivity = getReactApplicationContext().getCurrentActivity();
         if (currentActivity == null) {
             // The currentActivity can be null if it is backgrounded / destroyed, so we simply
             // no-op to prevent any null pointer exceptions.
@@ -208,7 +206,7 @@ public class CodePushNativeModule extends ReactContextBaseJavaModule {
             return instanceManager;
         }
 
-        final Activity currentActivity = getCurrentActivity();
+        final Activity currentActivity = getReactApplicationContext().getCurrentActivity();
         if (currentActivity == null) {
             return null;
         }
@@ -320,9 +318,9 @@ public class CodePushNativeModule extends ReactContextBaseJavaModule {
                             getReactApplicationContext().runOnUiQueueThread(new Runnable() {
                                 @Override
                                 public void run() {
-                                    ReactChoreographer.getInstance().postFrameCallback(ReactChoreographer.CallbackType.TIMERS_EVENTS, new ChoreographerCompat.FrameCallback() {
+                                    new Handler(Looper.getMainLooper()).post(new Runnable() {
                                         @Override
-                                        public void doFrame(long frameTimeNanos) {
+                                        public void run() {
                                             if (!latestDownloadProgress.isCompleted()) {
                                                 dispatchDownloadProgressEvent();
                                             }

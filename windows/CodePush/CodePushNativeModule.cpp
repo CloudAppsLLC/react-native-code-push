@@ -707,12 +707,18 @@ namespace Microsoft::CodePush::ReactNative
 	{
 		auto localSettings{ GetLocalSettings() };
 		auto res{ localSettings.Values().TryLookup(LatestRollbackInfoKey) };
-		auto infoString{ unbox_value<hstring>(res) };
-		JsonObject latestRollbackInfo;
-		auto success{ JsonObject::TryParse(infoString, latestRollbackInfo) };
-		if (success)
-		{
-			promise.Resolve(latestRollbackInfo);
+		if (res != nullptr) {
+			auto infoString{ unbox_value<hstring>(res) };
+			JsonObject latestRollbackInfo;
+			auto success{ JsonObject::TryParse(infoString, latestRollbackInfo) };
+			if (success)
+			{
+				promise.Resolve(latestRollbackInfo);
+			}
+			else
+			{
+				promise.Resolve(JsonValue::CreateNullValue());
+			}
 		}
 		else
 		{

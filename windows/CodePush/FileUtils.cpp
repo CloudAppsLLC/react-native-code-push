@@ -46,33 +46,54 @@ namespace Microsoft::CodePush::ReactNative
         co_return file;
     }
 
-    /*static*/ IAsyncOperation<hstring> FileUtils::FindFilePathAsync(const StorageFolder& rootFolder, std::wstring_view fileName)
+/*static*/ IAsyncOperation<hstring> FileUtils::FindFilePathAsync(
+    const StorageFolder& rootFolder,
+    std::wstring_view fileName)
+{
+    try
     {
-        try
-        {
-            std::vector<hstring> fileTypeFilter{};
-            fileTypeFilter.push_back(L".bundle");
-            QueryOptions queryOptions{ CommonFileQuery::OrderByName, fileTypeFilter };
-            queryOptions.IndexerOption(IndexerOption::DoNotUseIndexer);
-            queryOptions.ApplicationSearchFilter(L"System.FileName: " + fileName);
-            auto queryResult{ rootFolder.CreateFileQueryWithOptions(queryOptions) };
-            auto files{ co_await queryResult.GetFilesAsync() };
+        // Filter to .bundle files (keep this; it's cheap and narrows scan)
+        std::vector<hstring> fileTypeFilter{};
+        fileTypeFilter.push_back(L".bundle");
+        fileTypeFilter.push_back(L".jsbundle");
 
-            if (files.Size() > 0)
-            {
-                auto result{ files.GetAt(0) };
-                std::wstring_view bundlePath{ result.Path() };
-                hstring filePathSub{ bundlePath.substr(rootFolder.Path().size() + 1) };
-                co_return filePathSub;
-            }
+        QueryOptions queryOptions{ CommonFileQuery::OrderByName, fileTypeFilter };
 
-            co_return L"";
-        }
-        catch (...)
+        // IMPORTANT: search recursively
+        queryOptions.FolderDepth(FolderDepth::Deep);
+
+        // Don’t rely on the system indexer for app-local folders
+        queryOptions.IndexerOption(IndexerOption::DoNotUseIndexer);
+
+        // Remove complex search filters - just find ANY bundle file
+        // Don't use ApplicationSearchFilter at all - it's causing issues
+        
+        auto queryResult = rootFolder.CreateFileQueryWithOptions(queryOptions);
+        auto files = co_await queryResult.GetFilesAsync();
+
+        if (files.Size() > 0)
         {
-            throw;
+            auto result = files.GetAt(0);
+            std::wstring_view bundlePath{ result.Path() };
+
+            // Return path relative to rootFolder
+            const auto rootPath = rootFolder.Path();
+            const size_t prefixLen = rootPath.size();
+            hstring relative = prefixLen < bundlePath.size()
+                ? hstring{ bundlePath.substr(prefixLen + 1) }  // skip trailing '\'
+                : hstring{ result.Name() };
+
+            co_return relative;
         }
+
+        co_return L"";
     }
+    catch (...)
+    {
+        throw;
+    }
+}
+
 
     /*static*/ IAsyncAction FileUtils::UnzipAsync(const StorageFile& zipFile, const StorageFolder& destination)
     {
