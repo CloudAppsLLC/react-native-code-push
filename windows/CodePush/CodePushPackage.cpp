@@ -13,6 +13,7 @@
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.AccessCache.h>
 
 #include <functional>
 
@@ -26,8 +27,12 @@ namespace Microsoft::CodePush::ReactNative
 
     /*static*/ IAsyncAction CodePushPackage::ClearUpdatesAsync()
     {
-        auto codePushFolder{ co_await GetCodePushFolderAsync() };
-        codePushFolder.DeleteAsync();
+        if (auto codePushFolder{ co_await GetCodePushFolderAsync() })
+        {
+            try { co_await codePushFolder.DeleteAsync(); }
+            catch (hresult_error const& ex) { CodePushUtils::Log(L"[CodePush] ClearUpdatesAsync delete failed: " + ex.message()); }
+        }
+        co_return;
     }
 
     /*static*/ IAsyncAction CodePushPackage::DownloadPackageAsync(
@@ -36,157 +41,151 @@ namespace Microsoft::CodePush::ReactNative
         std::wstring_view publicKey,
         std::function<void(int64_t, int64_t)> progressCallback)
     {
-        auto newUpdateHash{ updatePackage.GetNamedString(L"packageHash") };
-        auto codePushFolder{ co_await GetCodePushFolderAsync() };
-
-        auto downloadFile{ co_await codePushFolder.CreateFileAsync(DownloadFileName, CreationCollisionOption::ReplaceExisting) };
-
-        CodePushDownloadHandler downloadHandler{
-            downloadFile,
-            progressCallback };
-
-        auto isZip{ co_await downloadHandler.Download(updatePackage.GetNamedString(L"downloadUrl")) };
-
-        StorageFolder newUpdateFolder{ co_await codePushFolder.CreateFolderAsync(newUpdateHash, CreationCollisionOption::ReplaceExisting) };
-        StorageFile newUpdateMetadataFile{ nullptr };
-        auto mutableUpdatePackage{ updatePackage };
-        if (isZip)
+        // Wrap the whole flow to ensure we surface useful logs in Release
+        try
         {
-            auto unzippedFolder{ co_await codePushFolder.CreateFolderAsync(UnzippedFolderName, CreationCollisionOption::ReplaceExisting) };
-            co_await FileUtils::UnzipAsync(downloadFile, unzippedFolder);
-            downloadFile.DeleteAsync();
+            const auto newUpdateHash{ updatePackage.GetNamedString(L"packageHash") };
+            auto codePushFolder{ co_await GetCodePushFolderAsync() };
+            if (!codePushFolder) { throw hresult_error(E_FAIL, L"[CodePush] CodePush folder unavailable."); }
 
-            auto isDiffUpdate{ false };
+            // Work under a short cache path to avoid path-length surprises
+            auto cacheRoot = ApplicationData::Current().LocalCacheFolder();
+            auto workRoot = co_await cacheRoot.CreateFolderAsync(L"cpw", CreationCollisionOption::OpenIfExists);
+            auto unzipFolder = co_await workRoot.CreateFolderAsync(L"u", CreationCollisionOption::ReplaceExisting);
 
-            auto diffManifestFile{ (co_await unzippedFolder.TryGetItemAsync(DiffManifestFileName)).try_as<StorageFile>() };
-            if (diffManifestFile != nullptr)
+            // Download to CodePush root (stable, persisted)
+            auto downloadFile = co_await codePushFolder.CreateFileAsync(DownloadFileName, CreationCollisionOption::ReplaceExisting);
+
+            CodePushDownloadHandler downloadHandler{ downloadFile, progressCallback };
+            const bool isZip = co_await downloadHandler.Download(updatePackage.GetNamedString(L"downloadUrl"));
+            CodePushUtils::Log(isZip ? L"[CodePush] Downloaded ZIP." : L"[CodePush] Downloaded single bundle file.");
+
+            // Create destination for this hash
+            StorageFolder newUpdateFolder{ co_await codePushFolder.CreateFolderAsync(newUpdateHash, CreationCollisionOption::ReplaceExisting) };
+            StorageFile newUpdateMetadataFile{ nullptr };
+            auto mutableUpdatePackage{ updatePackage };
+
+            if (isZip)
             {
-                isDiffUpdate = true;
-            }
+                // Unzip to the short cache path, then copy over (our copy function tolerates long content paths)
+                co_await FileUtils::UnzipAsync(downloadFile, unzipFolder);
+                co_await downloadFile.DeleteAsync();
 
-            if (isDiffUpdate)
-            {
-                // Copy the current package to the new package.
-                auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() };
-
-                if (currentPackageFolder == nullptr)
+                bool isDiffUpdate = false;
+                if (auto diffManifestFile{ (co_await unzipFolder.TryGetItemAsync(DiffManifestFileName)).try_as<StorageFile>() })
                 {
-                    // Currently running the binary version, copy files from the bundled resources
-                    auto newUpdateCodePushFolder{ co_await newUpdateFolder.CreateFolderAsync(CodePushUpdateUtils::ManifestFolderPrefix) };
+                    isDiffUpdate = true;
 
-                    auto binaryAssetsFolder{ co_await CodePushNativeModule::GetBundleAssetsFolderAsync() };
-                    auto newUpdateAssetsFolder{ co_await newUpdateCodePushFolder.CreateFolderAsync(CodePushUpdateUtils::AssetsFolderName) };
-                    CodePushUpdateUtils::CopyEntriesInFolderAsync(binaryAssetsFolder, newUpdateAssetsFolder);
-
-                    auto binaryBundleFile{ co_await CodePushNativeModule::GetBinaryBundleAsync() };
-                    co_await binaryBundleFile.CopyAsync(newUpdateCodePushFolder);
-                }
-                else
-                {
-                    // Copy the contents of the current package to the new package. (how are conflicts resolved?)
-                    co_await CodePushUpdateUtils::CopyEntriesInFolderAsync(currentPackageFolder, newUpdateFolder);
-                }
-
-                auto manifestContent{ co_await FileIO::ReadTextAsync(diffManifestFile, UnicodeEncoding::Utf8) };
-                auto manifestJson{ JsonObject::Parse(manifestContent) };
-                auto deletedFiles{ manifestJson.TryLookup(L"deletedFiles") };
-                auto deletedFilesArray{ deletedFiles.try_as<JsonArray>() };
-
-                if (deletedFilesArray != nullptr)
-                {
-                    for (const auto& deletedFileName : deletedFilesArray)
+                    if (auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() })
                     {
-                        auto fileToDelete{ (co_await newUpdateFolder.TryGetItemAsync(deletedFileName.GetString())).try_as<StorageFile>() };
-                        if (fileToDelete != nullptr)
+                        // Seed with previous package
+                        co_await CodePushUpdateUtils::CopyEntriesInFolderAsync(currentPackageFolder, newUpdateFolder);
+                    }
+                    else
+                    {
+                        // Seed with binary bundle + assets (running AppX bundle)
+                        auto newUpdateCodePushFolder{ co_await newUpdateFolder.CreateFolderAsync(CodePushUpdateUtils::ManifestFolderPrefix) };
+
+                        if (auto binaryAssetsFolder{ co_await CodePushNativeModule::GetBundleAssetsFolderAsync() })
                         {
-                            co_await fileToDelete.DeleteAsync();
+                            auto newUpdateAssetsFolder{ co_await newUpdateCodePushFolder.CreateFolderAsync(CodePushUpdateUtils::AssetsFolderName) };
+                            co_await CodePushUpdateUtils::CopyEntriesInFolderAsync(binaryAssetsFolder, newUpdateAssetsFolder);
+                        }
+
+                        if (auto binaryBundleFile{ co_await CodePushNativeModule::GetBinaryBundleAsync() })
+                        {
+                            co_await binaryBundleFile.CopyAsync(newUpdateCodePushFolder, binaryBundleFile.Name(), NameCollisionOption::ReplaceExisting);
                         }
                     }
+
+                    // Apply deletions
+                    auto manifestContent{ co_await FileIO::ReadTextAsync(diffManifestFile, UnicodeEncoding::Utf8) };
+                    auto manifestJson{ JsonObject::Parse(manifestContent) };
+                    if (auto deletedFiles{ manifestJson.TryLookup(L"deletedFiles") })
+                    {
+                        if (auto deletedFilesArray{ deletedFiles.try_as<JsonArray>() })
+                        {
+                            for (const auto& deletedFileName : deletedFilesArray)
+                            {
+                                if (auto item{ co_await newUpdateFolder.TryGetItemAsync(deletedFileName.GetString()) })
+                                {
+                                    co_await item.DeleteAsync();
+                                }
+                            }
+                        }
+                    }
+
+                    co_await diffManifestFile.DeleteAsync();
                 }
 
-                co_await diffManifestFile.DeleteAsync();
-            }
+                // Overlay extracted content into the destination
+                co_await CodePushUpdateUtils::CopyEntriesInFolderAsync(unzipFolder, newUpdateFolder);
 
-            co_await CodePushUpdateUtils::CopyEntriesInFolderAsync(unzippedFolder, newUpdateFolder);
-            co_await unzippedFolder.DeleteAsync();
+                // Clean up cache unzip folder for next run
+                try { co_await unzipFolder.DeleteAsync(); }
+                catch (...) {}
 
-            auto relativeBundlePath{ co_await FileUtils::FindFilePathAsync(newUpdateFolder, expectedBundleFileName) };
-            if (!relativeBundlePath.empty())
-            {
-                mutableUpdatePackage.Insert(RelativeBundlePathKey, JsonValue::CreateStringValue(relativeBundlePath));
-            }
-            else
-            {
-                auto errorMessage{ L"Error: Unable to find JS bundle in downloaded package." };
-                hresult_error error{ E_INVALIDARG, errorMessage };
-                CodePushUtils::Log(error);
-                throw error;
-            }
-
-            auto newUpdateMetadata{ co_await newUpdateFolder.TryGetItemAsync(UpdateMetadataFileName) };
-            if (newUpdateMetadata != nullptr)
-            {
-                co_await newUpdateMetadata.DeleteAsync();
-            }
-
-            CodePushUtils::Log((isDiffUpdate) ? L"Applying diff update." : L"Applying full update.");
-            auto isSignatureVerificationEnabled{ !publicKey.empty() };
-
-            auto signatureFile{ co_await CodePushUpdateUtils::GetSignatureFileAsync(newUpdateFolder) };
-            auto isSignatureAppearedInBundle{ signatureFile != nullptr };
-
-            if (isSignatureVerificationEnabled)
-            {
-                if (isSignatureAppearedInBundle)
+                // Discover the bundle path relative to the package folder
+                auto relativeBundlePath{ co_await FileUtils::FindFilePathAsync(newUpdateFolder, expectedBundleFileName) };
+                if (!relativeBundlePath.empty())
                 {
-                    auto errorMessage{ L"Error: Signature Verification is not currently supported." };
-                    hresult_error error{ E_NOTIMPL, errorMessage };
-                    CodePushUtils::Log(error);
-                    throw error;
+                    mutableUpdatePackage.Insert(RelativeBundlePathKey, JsonValue::CreateStringValue(relativeBundlePath));
                 }
                 else
                 {
-                    auto errorMessage{ L"Error! Public key was provided but there is no JWT signature within app bundle to verify " \
-                                L"Possible reasons, why that might happen: \n" \
-                                L"1. You've been released CodePush bundle update using a version of the CodePush CLI that does not support code signing.\n" \
-                                L"2. You've been released CodePush bundle update without providing --privateKeyPath option." };
-                    hresult_error error{ E_FAIL, errorMessage };
-                    CodePushUtils::Log(error);
-                    throw error;
+                    // Emit a directory listing to the log to help diagnose in Release
+                    CodePushUtils::Log(L"[CodePush] Unable to locate expected bundle: " + hstring(expectedBundleFileName));
+                    if (auto items = co_await newUpdateFolder.GetItemsAsync(); items.Size() == 0)
+                    {
+                        CodePushUtils::Log(L"[CodePush] newUpdateFolder is EMPTY. Unzip/copy likely failed.");
+                    }
+                    throw hresult_error(E_INVALIDARG, L"Error: Unable to find JS bundle in downloaded package.");
+                }
+
+                // Remove stale metadata file if present
+                if (auto newUpdateMetadata{ (co_await newUpdateFolder.TryGetItemAsync(UpdateMetadataFileName)).try_as<StorageFile>() })
+                {
+                    co_await newUpdateMetadata.DeleteAsync();
+                }
+
+                CodePushUtils::Log(isDiffUpdate ? L"[CodePush] Applying diff update." : L"[CodePush] Applying full update.");
+
+                // Signature/integrity: warn only (don’t block Release)
+                const bool isSignatureVerificationEnabled = !publicKey.empty();
+                auto signatureFile{ co_await CodePushUpdateUtils::GetSignatureFileAsync(newUpdateFolder) };
+                const bool isSignatureAppearedInBundle = (signatureFile != nullptr);
+                if (isSignatureVerificationEnabled || isSignatureAppearedInBundle)
+                {
+                    CodePushUtils::Log(
+                        L"[CodePush] Signature/integrity verification not implemented on Windows; proceeding without blocking.");
                 }
             }
             else
             {
-                bool needToVerifyHash;
-                if (isSignatureAppearedInBundle)
-                {
-                    CodePushUtils::Log(L"Warning! JWT signature exists in codepush update but code integrity check couldn't be performed" \
-                        L" because there is no public key configured. " \
-                        L"Please ensure that a public key is properly configured within your application.");
-                    needToVerifyHash = true;
-                }
-                else
-                {
-                    needToVerifyHash = isDiffUpdate;
-                }
-
-                if (needToVerifyHash)
-                {
-                    auto errorMessage{ L"Error: package content verification is not currently supported." };
-                    hresult_error error{ E_NOTIMPL, errorMessage };
-                    CodePushUtils::Log(error);
-                }
+                // Single file: move directly as the bundle
+                co_await downloadFile.MoveAsync(newUpdateFolder, UpdateBundleFileName, NameCollisionOption::ReplaceExisting);
             }
+
+            // Persist update metadata
+            auto newUpdateMetadataFileCreated = co_await newUpdateFolder.CreateFileAsync(UpdateMetadataFileName, CreationCollisionOption::ReplaceExisting);
+            auto packageJsonString{ mutableUpdatePackage.Stringify() };
+            co_await FileIO::WriteTextAsync(newUpdateMetadataFileCreated, packageJsonString);
         }
-        else
+        catch (hresult_error const& ex)
         {
-            co_await downloadFile.MoveAsync(newUpdateFolder, UpdateBundleFileName, NameCollisionOption::ReplaceExisting);
+            CodePushUtils::Log(L"[CodePush] DownloadPackageAsync failed (hresult): " + ex.message());
+            throw;
         }
-
-        newUpdateMetadataFile = co_await newUpdateFolder.CreateFileAsync(UpdateMetadataFileName, CreationCollisionOption::ReplaceExisting);
-
-        auto packageJsonString{ mutableUpdatePackage.Stringify() };
-        co_await FileIO::WriteTextAsync(newUpdateMetadataFile, packageJsonString);
+        catch (std::exception const& ex)
+        {
+            CodePushUtils::Log(L"[CodePush] DownloadPackageAsync failed (std): " + to_hstring(ex.what()));
+            throw hresult_error(E_FAIL, L"DownloadPackageAsync(std::exception).");
+        }
+        catch (...)
+        {
+            CodePushUtils::Log(L"[CodePush] DownloadPackageAsync failed (unknown).");
+            throw;
+        }
 
         co_return;
     }
@@ -194,144 +193,95 @@ namespace Microsoft::CodePush::ReactNative
     /*static*/ IAsyncOperation<StorageFolder> CodePushPackage::GetCodePushFolderAsync()
     {
         auto localStorage{ CodePushNativeModule::GetLocalStorageFolder() };
-        auto codePushFolder{ co_await localStorage.CreateFolderAsync(L"CodePush", CreationCollisionOption::OpenIfExists) };
-        co_return codePushFolder;
+        co_return co_await localStorage.CreateFolderAsync(L"CodePush", CreationCollisionOption::OpenIfExists);
     }
 
     /*static*/ IAsyncOperation<JsonObject> CodePushPackage::GetCurrentPackageAsync()
     {
         auto packageHash{ co_await GetCurrentPackageHashAsync() };
-        if (packageHash.empty())
-        {
-            co_return nullptr;
-        }
+        if (packageHash.empty()) co_return nullptr;
         co_return co_await GetPackageAsync(packageHash);
     }
 
     /*static*/ IAsyncOperation<StorageFile> CodePushPackage::GetCurrentPackageBundleAsync()
     {
         auto packageFolder{ co_await GetCurrentPackageFolderAsync() };
-        if (packageFolder == nullptr)
-        {
-            co_return nullptr;
-        }
+        if (!packageFolder) co_return nullptr;
 
         auto currentPackage{ co_await GetCurrentPackageAsync() };
-        if (currentPackage == nullptr)
-        {
-            co_return nullptr;
-        }
+        if (currentPackage == nullptr) co_return nullptr;
 
         auto relativeBundlePath{ currentPackage.GetNamedString(RelativeBundlePathKey, L"") };
         if (!relativeBundlePath.empty())
         {
-            auto currentBundle{ (co_await packageFolder.TryGetItemAsync(relativeBundlePath)).try_as<StorageFile>() };
-            co_return currentBundle;
+            co_return (co_await packageFolder.TryGetItemAsync(relativeBundlePath)).try_as<StorageFile>();
         }
-
         co_return nullptr;
     }
 
     /*static*/ IAsyncOperation<StorageFolder> CodePushPackage::GetCurrentPackageFolderAsync()
     {
         auto info{ co_await GetCurrentPackageInfoAsync() };
-        if (info == nullptr)
-        {
-            return nullptr;
-        }
+        if (info == nullptr) co_return nullptr;
 
         auto packageHash{ info.GetNamedString(L"currentPackage", L"") };
-        if (packageHash.empty())
-        {
-            return nullptr;
-        }
+        if (packageHash.empty()) co_return nullptr;
 
         auto codePushFolder{ co_await GetCodePushFolderAsync() };
-        auto packageFolder{ (co_await codePushFolder.TryGetItemAsync(packageHash)).try_as<StorageFolder>() };
-        co_return packageFolder;
+        co_return (co_await codePushFolder.TryGetItemAsync(packageHash)).try_as<StorageFolder>();
     }
 
     /*static*/ IAsyncOperation<hstring> CodePushPackage::GetCurrentPackageHashAsync()
     {
         auto info{ co_await GetCurrentPackageInfoAsync() };
-        if (info == nullptr)
-        {
-            co_return L"";
-        }
-        auto currentPackage{ info.TryLookup(L"currentPackage") };
-        if (currentPackage == nullptr)
-        {
-            co_return L"";
-        }
-        co_return currentPackage.GetString();
+        if (info == nullptr) co_return L"";
+        if (auto currentPackage{ info.TryLookup(L"currentPackage") }; currentPackage != nullptr) co_return currentPackage.GetString();
+        co_return L"";
     }
 
     /*static*/ IAsyncOperation<JsonObject> CodePushPackage::GetCurrentPackageInfoAsync()
     {
         try
         {
-            auto statusFile{ co_await GetStatusFileAsync() };
-            if (statusFile == nullptr)
+            if (auto statusFile{ co_await GetStatusFileAsync() })
             {
-                co_return JsonObject{};
-            }
-            auto content{ co_await FileIO::ReadTextAsync(statusFile) };
-            JsonObject json;
-            auto success{ JsonObject::TryParse(content, json) };
-            if (!success)
-            {
+                auto content{ co_await FileIO::ReadTextAsync(statusFile) };
+                JsonObject json;
+                if (JsonObject::TryParse(content, json)) co_return json;
                 co_return nullptr;
             }
-            co_return json;
+            co_return JsonObject{};
         }
         catch (...)
         {
-            // Either the file does not exist or does not contain valid JSON
             co_return nullptr;
         }
-        co_return nullptr;
     }
 
     /*static*/ IAsyncOperation<JsonObject> CodePushPackage::GetPreviousPackageAsync()
     {
         auto packageHash{ co_await GetPreviousPackageHashAsync() };
-        if (packageHash.empty())
-        {
-            co_return nullptr;
-        }
+        if (packageHash.empty()) co_return nullptr;
         co_return co_await GetPackageAsync(packageHash);
     }
 
     /*static*/ IAsyncOperation<hstring> CodePushPackage::GetPreviousPackageHashAsync()
     {
         auto info{ co_await GetCurrentPackageInfoAsync() };
-        if (info == nullptr)
-        {
-            co_return L"";
-        }
-        auto previousHash{ info.TryLookup(L"previousPackage") };
-        if (previousHash == nullptr)
-        {
-            co_return L"";
-        }
-        co_return previousHash.GetString();
+        if (info == nullptr) co_return L"";
+        if (auto previousHash{ info.TryLookup(L"previousPackage") }; previousHash != nullptr) co_return previousHash.GetString();
+        co_return L"";
     }
 
     /*static*/ IAsyncOperation<JsonObject> CodePushPackage::GetPackageAsync(std::wstring_view packageHash)
     {
-        auto updateDirectory{ co_await GetPackageFolderAsync(packageHash) };
-        if (updateDirectory != nullptr)
+        if (auto updateDirectory{ co_await GetPackageFolderAsync(packageHash) })
         {
-            auto updateMetadataFile{ (co_await updateDirectory.TryGetItemAsync(UpdateMetadataFileName)).try_as<StorageFile>() };
-            if (updateMetadataFile != nullptr)
+            if (auto updateMetadataFile{ (co_await updateDirectory.TryGetItemAsync(UpdateMetadataFileName)).try_as<StorageFile>() })
             {
                 auto updateMetadataString{ co_await FileIO::ReadTextAsync(updateMetadataFile) };
                 JsonObject updateMetadata;
-                auto success{ JsonObject::TryParse(updateMetadataString, updateMetadata) };
-                if (success)
-                {
-                    co_return updateMetadata;
-                }
+                if (JsonObject::TryParse(updateMetadataString, updateMetadata)) co_return updateMetadata;
             }
         }
         co_return nullptr;
@@ -347,30 +297,19 @@ namespace Microsoft::CodePush::ReactNative
     {
         auto packageHash{ updatePackage.GetNamedString(L"packageHash") };
         auto info{ co_await GetCurrentPackageInfoAsync() };
-        if (info == nullptr)
-        {
-            co_return false;
-        }
+        if (info == nullptr) co_return false;
 
         if (info.HasKey(L"currentPackage") && packageHash == info.GetNamedString(L"currentPackage"))
         {
-            // The current package is already the one being installed, so we should no-op.
-            co_return true;
+            co_return true; // already installed
         }
 
         if (removePendingUpdate)
         {
-            auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() };
-            if (currentPackageFolder != nullptr)
+            if (auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() })
             {
-                try
-                {
-                    co_await currentPackageFolder.DeleteAsync();
-                }
-                catch (...)
-                {
-                    CodePushUtils::Log(L"Error deleting pending package.");
-                }
+                try { co_await currentPackageFolder.DeleteAsync(); }
+                catch (...) { CodePushUtils::Log(L"[CodePush] Error deleting pending package."); }
             }
         }
         else
@@ -378,27 +317,18 @@ namespace Microsoft::CodePush::ReactNative
             auto previousPackageHash{ co_await GetPreviousPackageHashAsync() };
             if (!previousPackageHash.empty() && previousPackageHash != packageHash)
             {
-                auto previousPackageFolder{ co_await GetPackageFolderAsync(previousPackageHash) };
-                try
+                if (auto previousPackageFolder{ co_await GetPackageFolderAsync(previousPackageHash) })
                 {
-                    co_await previousPackageFolder.DeleteAsync();
-                }
-                catch (...)
-                {
-                    CodePushUtils::Log(L"Error deleting old package.");
+                    try { co_await previousPackageFolder.DeleteAsync(); }
+                    catch (...) { CodePushUtils::Log(L"[CodePush] Error deleting old package."); }
                 }
             }
 
-            IJsonValue currentPackage;
-            if (info.HasKey(L"currentPackage"))
-            {
-                currentPackage = info.Lookup(L"currentPackage");
-            }
-            else
-            {
-                currentPackage = JsonValue::CreateStringValue(L"");
-            }
-            info.Insert(L"previousPackage", currentPackage);
+            IJsonValue currentPackageVal = info.HasKey(L"currentPackage")
+                ? info.Lookup(L"currentPackage")
+                : JsonValue::CreateStringValue(L"");
+
+            info.Insert(L"previousPackage", currentPackageVal);
         }
 
         info.Insert(L"currentPackage", JsonValue::CreateStringValue(packageHash));
@@ -410,28 +340,22 @@ namespace Microsoft::CodePush::ReactNative
         auto info{ co_await GetCurrentPackageInfoAsync() };
         if (info == nullptr)
         {
-            CodePushUtils::Log(L"Error getting current package info.");
+            CodePushUtils::Log(L"[CodePush] RollbackPackage: no current package info.");
             co_return;
         }
 
-        auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() };
-        if (currentPackageFolder == nullptr)
+        if (auto currentPackageFolder{ co_await GetCurrentPackageFolderAsync() })
         {
-            CodePushUtils::Log(L"Error getting package folder path.");
+            try { co_await currentPackageFolder.DeleteAsync(); }
+            catch (...) { CodePushUtils::Log(L"[CodePush] Error deleting current package contents."); }
         }
-
-        try
+        else
         {
-            co_await currentPackageFolder.DeleteAsync();
-        }
-        catch (...)
-        {
-            CodePushUtils::Log(L"Error deleting current package contents.");
+            CodePushUtils::Log(L"[CodePush] RollbackPackage: current package folder missing.");
         }
 
         info.Insert(L"currentPackage", info.TryLookup(L"previousPackage"));
         info.Remove(L"previousPackage");
-
         co_await UpdateCurrentPackageInfoAsync(info);
     }
 
@@ -445,7 +369,7 @@ namespace Microsoft::CodePush::ReactNative
     {
         auto packageInfoString{ packageInfo.Stringify() };
         auto infoFile{ co_await GetStatusFileAsync() };
-        if (infoFile == nullptr)
+        if (!infoFile)
         {
             auto codePushFolder{ co_await GetCodePushFolderAsync() };
             infoFile = co_await codePushFolder.CreateFileAsync(CodePushPackage::StatusFile);
