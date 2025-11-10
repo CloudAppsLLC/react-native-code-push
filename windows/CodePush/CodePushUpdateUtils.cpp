@@ -171,18 +171,17 @@ namespace Microsoft::CodePush::ReactNative
 	winrt::Windows::Foundation::IAsyncOperation<winrt::hstring>
 		CodePushUpdateUtils::ModifiedDateStringOfFileAsync(winrt::Windows::Storage::StorageFile const& file)
 	{
-		using winrt::Windows::Globalization::DateTimeFormatting::DateTimeFormatter;
 		using winrt::Windows::Storage::FileProperties::BasicProperties;
-		using winrt::Windows::Foundation::DateTime;
 
 		if (!file) co_return winrt::hstring{};  // null safety
 
 		BasicProperties props = co_await file.GetBasicPropertiesAsync();
-		DateTime dt = props.DateModified();     // ← explicit type, initialized right here
 
-		// Format as ISO-like string (adjust pattern as you prefer)
-		DateTimeFormatter fmt{ L"yyyy-MM-dd HH:mm:ss.ffff" };
-		co_return fmt.Format(dt);
+		// Windows::Foundation::DateTime .time_since_epoch() is 100-ns ticks since 1601-01-01 (UTC)
+		const auto ticks = props.DateModified().time_since_epoch().count();
+
+		// Return as string (stable, culture-agnostic)
+		co_return winrt::to_hstring(ticks);
 	}
 
 
