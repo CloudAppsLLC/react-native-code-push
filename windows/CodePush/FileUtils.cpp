@@ -215,6 +215,41 @@ namespace Microsoft::CodePush::ReactNative
             }
         }
 
+        // If expectedFileName contains subfolders, navigate through them
+        if (!expectedFileName.empty())
+        {
+            std::wstring expectedStr{ expectedFileName.data() };
+            std::replace(expectedStr.begin(), expectedStr.end(), L'/', L'\\');
+            std::vector<std::wstring> segments;
+            size_t start = 0;
+            for (size_t i = 0; i <= expectedStr.size(); ++i)
+            {
+                if (i == expectedStr.size() || expectedStr[i] == L'\\')
+                {
+                    if (i > start)
+                    {
+                        segments.push_back(expectedStr.substr(start, i - start));
+                    }
+                    start = i + 1;
+                }
+            }
+            if (!segments.empty())
+            {
+                StorageFolder currentFolder = rootFolder;
+                for (size_t i = 0; i < segments.size() - 1; ++i)
+                {
+                    auto item = co_await currentFolder.TryGetItemAsync(hstring{ segments[i] });
+                    currentFolder = item.try_as<StorageFolder>();
+                    if (!currentFolder) co_return L"";
+                }
+                auto fileItem = co_await currentFolder.TryGetItemAsync(hstring{ segments.back() });
+                if (fileItem)
+                {
+                    co_return hstring{ segments.back() };
+                }
+            }
+        }
+
         // 2) Fallback to first *.bundle / *.jsbundle
         auto types = winrt::single_threaded_vector<hstring>({ L".bundle", L".jsbundle" });
         QueryOptions q2{ CommonFileQuery::OrderByName, types };
@@ -240,6 +275,7 @@ namespace Microsoft::CodePush::ReactNative
         // Load whole ZIP safely
         IBuffer ibuf = co_await FileIO::ReadBufferAsync(zipFile);
         const uint32_t zipLen = ibuf ? ibuf.Length() : 0;
+        CodePushUtils::Log(L"[Unzip] ZIP buffer length: " + to_hstring(zipLen));
         if (zipLen == 0) {
             CodePushUtils::Log(L"[Unzip] ZIP buffer is empty.");
             co_return;
@@ -260,6 +296,7 @@ namespace Microsoft::CodePush::ReactNative
         }
 
         const mz_uint numFiles = mz_zip_reader_get_num_files(&za);
+        CodePushUtils::Log(L"[Unzip] Number of files in ZIP: " + to_hstring(numFiles));
 
         // Safety rails (defense-in-depth for Release)
         constexpr size_t kMaxEntryBytes = size_t(200) * 1024 * 1024; // 200 MB per file
@@ -287,6 +324,8 @@ namespace Microsoft::CodePush::ReactNative
             // Convert to std::filesystem path (POSIX separators OK)
             std::filesystem::path rel{ cname };
 
+            CodePushUtils::Log(L"[Unzip] Extracting: " + hstring{ wname } + L" size=" + to_hstring(st.m_uncomp_size));
+
             // Size rails
             if (st.m_uncomp_size > kMaxEntryBytes) {
                 CodePushUtils::Log(L"[Unzip] Skipping oversized entry: " + hstring{ wname });
@@ -307,6 +346,7 @@ namespace Microsoft::CodePush::ReactNative
 
             try
             {
+                CodePushUtils::Log(L"[Unzip] Writing file: " + hstring{ wname });
                 // Create the destination file (sanitization happens inside)
                 StorageFile outFile = co_await CreateFileFromPathAsync(destination, rel);
 
@@ -326,6 +366,7 @@ namespace Microsoft::CodePush::ReactNative
                 rw.Close();
 
                 totalOut += outSize;
+                CodePushUtils::Log(L"[Unzip] File written: " + outFile.Path());
             }
             catch (winrt::hresult_error const& ex)
             {
@@ -339,6 +380,7 @@ namespace Microsoft::CodePush::ReactNative
         }
 
         mz_zip_reader_end(&za);
+        CodePushUtils::Log(L"[Unzip] Extraction complete. Total bytes: " + to_hstring(totalOut));
         co_return;
     }
 

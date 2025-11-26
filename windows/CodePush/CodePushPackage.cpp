@@ -15,7 +15,9 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.AccessCache.h>
 
+#include <algorithm>
 #include <functional>
+#include <vector>
 
 namespace Microsoft::CodePush::ReactNative
 {
@@ -206,16 +208,74 @@ namespace Microsoft::CodePush::ReactNative
     /*static*/ IAsyncOperation<StorageFile> CodePushPackage::GetCurrentPackageBundleAsync()
     {
         auto packageFolder{ co_await GetCurrentPackageFolderAsync() };
-        if (!packageFolder) co_return nullptr;
-
         auto currentPackage{ co_await GetCurrentPackageAsync() };
-        if (currentPackage == nullptr) co_return nullptr;
+        // If no current package, revert to original binary bundle
+        if (!packageFolder || currentPackage == nullptr)
+        {
+            CodePushUtils::Log(L"[CodePush] GetCurrentPackageBundleAsync: No current package, loading binary bundle");
+            co_return co_await CodePushNativeModule::GetBinaryBundleAsync();
+        }
 
         auto relativeBundlePath{ currentPackage.GetNamedString(RelativeBundlePathKey, L"") };
         if (!relativeBundlePath.empty())
         {
-            co_return (co_await packageFolder.TryGetItemAsync(relativeBundlePath)).try_as<StorageFile>();
+            CodePushUtils::Log(L"[CodePush] Looking for bundle at relative path: " + relativeBundlePath);
+            // Convert path separators to backslashes and split into segments
+            std::wstring pathStr{ relativeBundlePath.c_str() };
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            // Split path by backslashes to navigate through folders
+            std::vector<std::wstring> segments;
+            size_t start = 0;
+            for (size_t i = 0; i <= pathStr.size(); ++i)
+            {
+                if (i == pathStr.size() || pathStr[i] == L'\\')
+                {
+                    if (i > start)
+                    {
+                        segments.push_back(pathStr.substr(start, i - start));
+                    }
+                    start = i + 1;
+                }
+            }
+            if (segments.empty()) 
+            {
+                CodePushUtils::Log(L"[CodePush] No segments found in path");
+                co_return nullptr;
+            }
+            CodePushUtils::Log(L"[CodePush] Path has " + to_hstring(segments.size()) + L" segment(s)");
+            // Navigate through folders
+            StorageFolder currentFolder = packageFolder;
+            for (size_t i = 0; i < segments.size() - 1; ++i)
+            {
+                CodePushUtils::Log(L"[CodePush] Navigating to folder: " + hstring{ segments[i] });
+                auto item = co_await currentFolder.TryGetItemAsync(hstring{ segments[i] });
+                currentFolder = item.try_as<StorageFolder>();
+                if (!currentFolder) 
+                {
+                    CodePushUtils::Log(L"[CodePush] Folder not found: " + hstring{ segments[i] });
+                    co_return nullptr;
+                }
+            }
+            // Get the final file
+            CodePushUtils::Log(L"[CodePush] Looking for file: " + hstring{ segments.back() });
+            auto fileItem = co_await currentFolder.TryGetItemAsync(hstring{ segments.back() });
+            if (!fileItem)
+            {
+                CodePushUtils::Log(L"[CodePush] File not found: " + hstring{ segments.back() });
+                co_return nullptr;
+            }
+            auto bundleFile = fileItem.try_as<StorageFile>();
+            if (bundleFile)
+            {
+                CodePushUtils::Log(L"[CodePush] Bundle file found successfully: " + bundleFile.Path());
+            }
+            else
+            {
+                CodePushUtils::Log(L"[CodePush] Item is not a file: " + hstring{ segments.back() });
+            }
+            co_return bundleFile;
         }
+        CodePushUtils::Log(L"[CodePush] relativeBundlePath is empty");
         co_return nullptr;
     }
 
