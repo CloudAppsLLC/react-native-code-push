@@ -230,8 +230,12 @@ public class CodePushNativeModule extends ReactContextBaseJavaModule {
 
         this._restartInProgress = true;
         if (!onlyIfUpdateIsPending || mSettingsManager.isPendingUpdate(null)) {
-            loadBundle();
-            CodePushUtils.log("Restarting app");
+            if (getReactApplicationContext().hasActiveCatalystInstance()) {
+                loadBundle();
+                CodePushUtils.log("Restarting app");
+            } else {
+                CodePushUtils.log("Cannot restart app: CatalystInstance is not active");
+            }
             return;
         }
 
@@ -315,27 +319,34 @@ public class CodePushNativeModule extends ReactContextBaseJavaModule {
                             }
 
                             hasScheduledNextFrame = true;
-                            getReactApplicationContext().runOnUiQueueThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    new Handler(Looper.getMainLooper()).post(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            if (!latestDownloadProgress.isCompleted()) {
-                                                dispatchDownloadProgressEvent();
+                            if (getReactApplicationContext().hasActiveCatalystInstance()) {
+                                getReactApplicationContext().runOnUiQueueThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        new Handler(Looper.getMainLooper()).post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                if (!latestDownloadProgress.isCompleted()) {
+                                                    dispatchDownloadProgressEvent();
+                                                }
+                                                hasScheduledNextFrame = false;
                                             }
-
-                                            hasScheduledNextFrame = false;
-                                        }
-                                    });
-                                }
-                            });
+                                        });
+                                    }
+                                });
+                            } else {
+                                CodePushUtils.log("Cannot run UI thread code: CatalystInstance is not active");
+                            }
                         }
 
                         public void dispatchDownloadProgressEvent() {
-                            getReactApplicationContext()
-                                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                                    .emit(CodePushConstants.DOWNLOAD_PROGRESS_EVENT_NAME, latestDownloadProgress.createWritableMap());
+                            if (getReactApplicationContext().hasActiveCatalystInstance()) {
+                                getReactApplicationContext()
+                                        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                                        .emit(CodePushConstants.DOWNLOAD_PROGRESS_EVENT_NAME, latestDownloadProgress.createWritableMap());
+                            } else {
+                                CodePushUtils.log("Cannot emit event: CatalystInstance is not active");
+                            }
                         }
                     }, mCodePush.getPublicKey());
 
